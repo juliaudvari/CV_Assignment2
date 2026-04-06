@@ -6,7 +6,6 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
@@ -17,12 +16,14 @@ DEFAULT_TRAIN = _ROOT / "chest_xray" / "train"
 DEFAULT_TEST = _ROOT / "chest_xray" / "test"
 OUTPUT_DIR = SCRIPT_DIR / "outputs"
 
-BATCH_SIZE = 12
-EPOCHS = 5
+BATCH_SIZE = 16
+EPOCHS = 8
 IMG_SIZE = 128
+SEED = 123
 
 
 def main() -> None:
+    tf.keras.utils.set_random_seed(SEED)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     train_dir, test_dir = DEFAULT_TRAIN, DEFAULT_TEST
     if not train_dir.is_dir() or not test_dir.is_dir():
@@ -32,7 +33,7 @@ def main() -> None:
         train_dir,
         validation_split=0.2,
         subset="both",
-        seed=123,
+        seed=SEED,
         image_size=(IMG_SIZE, IMG_SIZE),
         batch_size=BATCH_SIZE,
         labels="inferred",
@@ -40,7 +41,7 @@ def main() -> None:
     )
     test_ds = keras.utils.image_dataset_from_directory(
         test_dir,
-        seed=123,
+        seed=SEED,
         image_size=(IMG_SIZE, IMG_SIZE),
         batch_size=BATCH_SIZE,
         labels="inferred",
@@ -48,7 +49,6 @@ def main() -> None:
     )
     class_names = train_ds.class_names
     num_classes = len(class_names)
-    print("Classes:", class_names)
 
     train_ds = train_ds.cache().prefetch(tf.data.AUTOTUNE)
     val_ds = val_ds.cache().prefetch(tf.data.AUTOTUNE)
@@ -71,39 +71,39 @@ def main() -> None:
         ]
     )
     model.compile(
-        optimizer=keras.optimizers.Adam(),
+        optimizer=keras.optimizers.Adam(1e-3),
         loss="sparse_categorical_crossentropy",
         metrics=["accuracy"],
     )
 
-    ckpt = OUTPUT_DIR / "pneumonia.keras"
+    best_path = OUTPUT_DIR / "best_scratch.keras"
     history = model.fit(
         train_ds,
         validation_data=val_ds,
         epochs=EPOCHS,
         callbacks=[
             keras.callbacks.ModelCheckpoint(
-                filepath=str(ckpt),
-                save_best_only=True,
+                filepath=str(best_path),
                 monitor="val_accuracy",
                 mode="max",
-            )
+                save_best_only=True,
+                verbose=1,
+            ),
+            keras.callbacks.EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True),
         ],
         verbose=1,
     )
 
-    loss, acc = model.evaluate(test_ds, verbose=1)
-    print(f"Test loss={loss:.4f} acc={acc:.4f}")
+    model.evaluate(test_ds, verbose=1)
 
     fig, ax = plt.subplots(1, 1, figsize=(6, 4))
-    ax.plot(history.history["accuracy"], label="train")
-    ax.plot(history.history["val_accuracy"], label="val")
-    ax.set_title("Accuracy")
+    ax.plot(history.history["loss"], label="train")
+    ax.plot(history.history["val_loss"], label="val")
+    ax.set_title("Loss")
     ax.legend()
     fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "history_accuracy.png", dpi=120)
+    fig.savefig(OUTPUT_DIR / "history_loss.png", dpi=120)
     plt.close(fig)
-    print(f"Saved plots under {OUTPUT_DIR.resolve()}")
 
 
 if __name__ == "__main__":
