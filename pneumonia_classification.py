@@ -17,7 +17,7 @@ DEFAULT_TEST = _ROOT / "chest_xray" / "test"
 OUTPUT_DIR = SCRIPT_DIR / "outputs"
 
 BATCH_SIZE = 16
-EPOCHS = 8
+EPOCHS = 10
 IMG_SIZE = 128
 SEED = 123
 
@@ -47,8 +47,7 @@ def main() -> None:
         labels="inferred",
         shuffle=False,
     )
-    class_names = train_ds.class_names
-    num_classes = len(class_names)
+    num_classes = len(train_ds.class_names)
 
     train_ds = train_ds.cache().prefetch(tf.data.AUTOTUNE)
     val_ds = val_ds.cache().prefetch(tf.data.AUTOTUNE)
@@ -58,15 +57,14 @@ def main() -> None:
         [
             layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3)),
             layers.Rescaling(1.0 / 255.0),
-            layers.Conv2D(16, 3, activation="relu", padding="same"),
-            layers.MaxPooling2D(2),
             layers.Conv2D(32, 3, activation="relu", padding="same"),
             layers.MaxPooling2D(2),
-            layers.Conv2D(32, 3, activation="relu", padding="same"),
+            layers.Conv2D(64, 3, activation="relu", padding="same"),
             layers.MaxPooling2D(2),
-            layers.Flatten(),
-            layers.Dense(512, activation="relu"),
-            layers.Dropout(0.2),
+            layers.Conv2D(64, 3, activation="relu", padding="same"),
+            layers.GlobalAveragePooling2D(),
+            layers.Dense(128, activation="relu"),
+            layers.Dropout(0.3),
             layers.Dense(num_classes, activation="softmax"),
         ]
     )
@@ -76,7 +74,7 @@ def main() -> None:
         metrics=["accuracy"],
     )
 
-    best_path = OUTPUT_DIR / "best_scratch.keras"
+    best_path = OUTPUT_DIR / "best_gap_scratch.keras"
     history = model.fit(
         train_ds,
         validation_data=val_ds,
@@ -89,20 +87,18 @@ def main() -> None:
                 save_best_only=True,
                 verbose=1,
             ),
-            keras.callbacks.EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True),
+            keras.callbacks.EarlyStopping(monitor="val_loss", patience=4, restore_best_weights=True),
         ],
         verbose=1,
     )
 
     model.evaluate(test_ds, verbose=1)
-
     fig, ax = plt.subplots(1, 1, figsize=(6, 4))
-    ax.plot(history.history["loss"], label="train")
-    ax.plot(history.history["val_loss"], label="val")
-    ax.set_title("Loss")
+    ax.plot(history.history["val_accuracy"], label="val acc")
+    ax.set_title("Val accuracy (GAP scratch)")
     ax.legend()
     fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "history_loss.png", dpi=120)
+    fig.savefig(OUTPUT_DIR / "val_accuracy_gap.png", dpi=120)
     plt.close(fig)
 
 
