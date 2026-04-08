@@ -10,6 +10,7 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.applications import EfficientNetB0
+from tensorflow.keras.applications.efficientnet import preprocess_input
 from tensorflow.keras.layers import Dense, Dropout, GlobalAveragePooling2D, Input
 from tensorflow.keras.models import Model
 
@@ -53,8 +54,9 @@ def load_ds(train_dir: Path, test_dir: Path):
 
 def build_model(num_classes: int) -> Model:
     inputs = Input(shape=(IMG_SIZE, IMG_SIZE, 3))
-    x = layers.Rescaling(1.0 / 255.0)(inputs)
-    base = EfficientNetB0(include_top=False, weights="imagenet")
+    # float rgb in 0 to 255 from image_dataset
+    x = layers.Lambda(lambda t: preprocess_input(t))(inputs)
+    base = EfficientNetB0(include_top=False, weights="imagenet", name="efficientnetb0")
     base.trainable = False
     x = base(x, training=False)
     x = GlobalAveragePooling2D()(x)
@@ -85,7 +87,7 @@ def main() -> None:
         epochs=EPOCHS,
         callbacks=[
             keras.callbacks.ModelCheckpoint(
-                str(OUTPUT_DIR / "eff_b0_no_prep.keras"),
+                str(OUTPUT_DIR / "eff_nested.keras"),
                 monitor="val_accuracy",
                 mode="max",
                 save_best_only=True,
@@ -96,10 +98,10 @@ def main() -> None:
     model.evaluate(test_ds, verbose=1)
     fig, ax = plt.subplots(figsize=(5, 4))
     ax.plot(hist.history["val_accuracy"], label="val")
-    ax.set_title("EfficientNet (no proper preprocess)")
+    ax.set_title("Nested EfficientNet + preprocess_input")
     ax.legend()
     fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "val_acc_eff_wrong_prep.png", dpi=120)
+    fig.savefig(OUTPUT_DIR / "val_acc_nested.png", dpi=120)
     plt.close(fig)
 
 
