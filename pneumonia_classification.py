@@ -22,7 +22,7 @@ OUTPUT_DIR = SCRIPT_DIR / "outputs"
 
 IMG_SIZE = 224
 BATCH_SIZE = 16
-EPOCHS = 6
+EPOCHS = 5
 SEED = 123
 
 
@@ -54,8 +54,8 @@ def load_ds(train_dir: Path, test_dir: Path):
 
 def build_model(num_classes: int) -> Model:
     inputs = Input(shape=(IMG_SIZE, IMG_SIZE, 3))
-    # float rgb in 0 to 255 from image_dataset
-    x = layers.Lambda(lambda t: preprocess_input(t))(inputs)
+    x = layers.Rescaling(1.0 / 255.0)(inputs)
+    x = layers.Lambda(lambda t: preprocess_input(t))(x)
     base = EfficientNetB0(include_top=False, weights="imagenet", name="efficientnetb0")
     base.trainable = False
     x = base(x, training=False)
@@ -74,8 +74,7 @@ def main() -> None:
         raise SystemExit(f"Missing data:\n  {train_dir}\n  {test_dir}")
 
     train_ds, val_ds, test_ds, class_names = load_ds(train_dir, test_dir)
-    num_classes = len(class_names)
-    model = build_model(num_classes)
+    model = build_model(len(class_names))
     model.compile(
         optimizer=keras.optimizers.Adam(1e-3),
         loss="sparse_categorical_crossentropy",
@@ -85,23 +84,16 @@ def main() -> None:
         train_ds,
         validation_data=val_ds,
         epochs=EPOCHS,
-        callbacks=[
-            keras.callbacks.ModelCheckpoint(
-                str(OUTPUT_DIR / "eff_nested.keras"),
-                monitor="val_accuracy",
-                mode="max",
-                save_best_only=True,
-            )
-        ],
         verbose=1,
     )
     model.evaluate(test_ds, verbose=1)
+    model.save(OUTPUT_DIR / "eff_double_scale.keras")
     fig, ax = plt.subplots(figsize=(5, 4))
     ax.plot(hist.history["val_accuracy"], label="val")
-    ax.set_title("Nested EfficientNet + preprocess_input")
+    ax.set_title("EfficientNet (double scale bug)")
     ax.legend()
     fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "val_acc_nested.png", dpi=120)
+    fig.savefig(OUTPUT_DIR / "val_acc_double_scale.png", dpi=120)
     plt.close(fig)
 
 
