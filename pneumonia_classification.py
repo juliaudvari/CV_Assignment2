@@ -10,7 +10,7 @@ from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.applications import EfficientNetB0
 from tensorflow.keras.applications.efficientnet import preprocess_input
-from tensorflow.keras.layers import Dense, Dropout, GlobalAveragePooling2D, Input
+from tensorflow.keras.layers import BatchNormalization, Dense, Dropout, GlobalAveragePooling2D, Input
 from tensorflow.keras.models import Model
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -70,12 +70,13 @@ def load_ds(train_dir: Path, test_dir: Path):
 
 def build_model(num_classes: int, augment: keras.Sequential) -> Model:
     inputs = Input(shape=(IMG_SIZE, IMG_SIZE, 3))
-    x = augment(inputs)
+    x = augment(inputs, training=True)
     x = EfficientNetPreprocess()(x)
     base = EfficientNetB0(include_top=False, weights="imagenet", name="efficientnetb0")
     base.trainable = False
     x = base(x, training=False)
     x = GlobalAveragePooling2D()(x)
+    x = BatchNormalization()(x)
     x = Dense(128, activation="relu")(x)
     x = Dropout(0.35)(x)
     out = Dense(num_classes, activation="softmax")(x)
@@ -103,7 +104,7 @@ def main() -> None:
         epochs=EPOCHS,
         callbacks=[
             keras.callbacks.ModelCheckpoint(
-                str(OUTPUT_DIR / "eff_prep_layer.keras"),
+                str(OUTPUT_DIR / "aug_train_true.keras"),
                 monitor="val_accuracy",
                 mode="max",
                 save_best_only=True,
