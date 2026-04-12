@@ -5,7 +5,6 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
@@ -22,8 +21,25 @@ OUTPUT_DIR = SCRIPT_DIR / "outputs"
 
 IMG_SIZE = 224
 BATCH_SIZE = 16
-EPOCHS = 5
+EPOCHS = 6
 SEED = 123
+
+
+@keras.utils.register_keras_serializable(package="cv_ca2")
+class EfficientNetPreprocess(layers.Layer):
+    def call(self, x):
+        return preprocess_input(x)
+
+
+def make_augmentation() -> keras.Sequential:
+    return keras.Sequential(
+        [
+            layers.RandomFlip("horizontal"),
+            layers.RandomRotation(0.06),
+            layers.RandomZoom(0.1),
+        ],
+        name="data_augmentation",
+    )
 
 
 def load_ds(train_dir: Path, test_dir: Path):
@@ -52,16 +68,16 @@ def load_ds(train_dir: Path, test_dir: Path):
     return train_ds, val_ds, test_ds, names
 
 
-def build_model(num_classes: int) -> Model:
+def build_model(num_classes: int, augment: keras.Sequential) -> Model:
     inputs = Input(shape=(IMG_SIZE, IMG_SIZE, 3))
-    x = layers.Rescaling(1.0 / 255.0)(inputs)
-    x = layers.Lambda(lambda t: preprocess_input(t))(x)
+    x = augment(inputs)
+    x = EfficientNetPreprocess()(x)
     base = EfficientNetB0(include_top=False, weights="imagenet", name="efficientnetb0")
     base.trainable = False
     x = base(x, training=False)
     x = GlobalAveragePooling2D()(x)
     x = Dense(128, activation="relu")(x)
-    x = Dropout(0.3)(x)
+    x = Dropout(0.35)(x)
     out = Dense(num_classes, activation="softmax")(x)
     return Model(inputs, out)
 
@@ -74,27 +90,28 @@ def main() -> None:
         raise SystemExit(f"Missing data:\n  {train_dir}\n  {test_dir}")
 
     train_ds, val_ds, test_ds, class_names = load_ds(train_dir, test_dir)
-    model = build_model(len(class_names))
+    aug = make_augmentation()
+    model = build_model(len(class_names), aug)
     model.compile(
-        optimizer=keras.optimizers.Adam(1e-3),
+        optimizer=keras.optimizers.Adam(3e-4),
         loss="sparse_categorical_crossentropy",
         metrics=["accuracy"],
     )
-    hist = model.fit(
+    model.fit(
         train_ds,
         validation_data=val_ds,
         epochs=EPOCHS,
+        callbacks=[
+            keras.callbacks.ModelCheckpoint(
+                str(OUTPUT_DIR / "eff_prep_layer.keras"),
+                monitor="val_accuracy",
+                mode="max",
+                save_best_only=True,
+            )
+        ],
         verbose=1,
     )
     model.evaluate(test_ds, verbose=1)
-    model.save(OUTPUT_DIR / "eff_double_scale.keras")
-    fig, ax = plt.subplots(figsize=(5, 4))
-    ax.plot(hist.history["val_accuracy"], label="val")
-    ax.set_title("EfficientNet (double scale bug)")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "val_acc_double_scale.png", dpi=120)
-    plt.close(fig)
 
 
 if __name__ == "__main__":
