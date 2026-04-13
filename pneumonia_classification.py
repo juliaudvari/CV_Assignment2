@@ -5,7 +5,10 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 import tensorflow as tf
+from sklearn.utils.class_weight import compute_class_weight
 from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.applications import EfficientNetB0
@@ -18,10 +21,10 @@ _ROOT = SCRIPT_DIR if (SCRIPT_DIR / "chest_xray").is_dir() else SCRIPT_DIR.paren
 DEFAULT_TRAIN = _ROOT / "chest_xray" / "train"
 DEFAULT_TEST = _ROOT / "chest_xray" / "test"
 OUTPUT_DIR = SCRIPT_DIR / "outputs"
+MODEL_PATH = OUTPUT_DIR / "best_chest_xray.keras"
 
 IMG_SIZE = 224
 BATCH_SIZE = 16
-EPOCHS = 6
 SEED = 123
 
 
@@ -35,8 +38,8 @@ def make_augmentation() -> keras.Sequential:
     return keras.Sequential(
         [
             layers.RandomFlip("horizontal"),
-            layers.RandomRotation(0.06),
-            layers.RandomZoom(0.1),
+            layers.RandomRotation(0.08),
+            layers.RandomZoom(0.12),
         ],
         name="data_augmentation",
     )
@@ -68,6 +71,20 @@ def load_ds(train_dir: Path, test_dir: Path):
     return train_ds, val_ds, test_ds, names
 
 
+def class_weights_for_dataset(train_ds: tf.data.Dataset, num_classes: int) -> dict[int, float]:
+    labels = np.concatenate([y.numpy() for _, y in train_ds], axis=0)
+    classes = np.arange(num_classes)
+    cw = compute_class_weight(class_weight="balanced", classes=classes, y=labels)
+    return {int(i): float(w) for i, w in enumerate(cw)}
+
+
+def get_inner_backbone(model: Model) -> keras.Model:
+    for layer in model.layers:
+        if isinstance(layer, keras.Model) and "efficientnet" in layer.name.lower():
+            return layer
+    raise ValueError("No EfficientNet backbone found.")
+
+
 def build_model(num_classes: int, augment: keras.Sequential) -> Model:
     inputs = Input(shape=(IMG_SIZE, IMG_SIZE, 3))
     x = augment(inputs, training=True)
@@ -77,8 +94,8 @@ def build_model(num_classes: int, augment: keras.Sequential) -> Model:
     x = base(x, training=False)
     x = GlobalAveragePooling2D()(x)
     x = BatchNormalization()(x)
-    x = Dense(128, activation="relu")(x)
-    x = Dropout(0.35)(x)
+    x = Dense(256, activation="relu")(x)
+    x = Dropout(0.45)(x)
     out = Dense(num_classes, activation="softmax")(x)
     return Model(inputs, out)
 
@@ -91,28 +108,72 @@ def main() -> None:
         raise SystemExit(f"Missing data:\n  {train_dir}\n  {test_dir}")
 
     train_ds, val_ds, test_ds, class_names = load_ds(train_dir, test_dir)
+    num_classes = len(class_names)
+    cw = class_weights_for_dataset(train_ds, num_classes)
+    print("Class weights:", cw)
+
     aug = make_augmentation()
-    model = build_model(len(class_names), aug)
+    model = build_model(num_classes, aug)
     model.compile(
         optimizer=keras.optimizers.Adam(3e-4),
         loss="sparse_categorical_crossentropy",
         metrics=["accuracy"],
     )
+
+    ckpt = keras.callbacks.ModelCheckpoint(
+        filepath=str(MODEL_PATH),
+        monitor="val_accuracy",
+        mode="max",
+        save_best_only=True,
+        verbose=1,
+    )
+    es = keras.callbacks.EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True)
+
+    e1, e2 = 8, 5
+    print("--- Phase 1 ---")
     model.fit(
         train_ds,
         validation_data=val_ds,
-        epochs=EPOCHS,
-        callbacks=[
-            keras.callbacks.ModelCheckpoint(
-                str(OUTPUT_DIR / "aug_train_true.keras"),
-                monitor="val_accuracy",
-                mode="max",
-                save_best_only=True,
-            )
-        ],
+        epochs=e1,
+        class_weight=cw,
+        callbacks=[ckpt, es],
         verbose=1,
     )
+
+    backbone = get_inner_backbone(model)
+    backbone.trainable = True
+    freeze_until = max(0, len(backbone.layers) - 40)
+    for layer in backbone.layers[:freeze_until]:
+        layer.trainable = False
+
+    model.compile(
+        optimizer=keras.optimizers.Adam(8e-5),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+    print("--- Phase 2 ---")
+    hist2 = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=e2,
+        class_weight=cw,
+        callbacks=[ckpt, es],
+        verbose=1,
+    )
+
+    if MODEL_PATH.is_file():
+        model = keras.models.load_model(
+            MODEL_PATH,
+            custom_objects={"EfficientNetPreprocess": EfficientNetPreprocess},
+        )
+
     model.evaluate(test_ds, verbose=1)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    ax.plot(hist2.history["val_accuracy"], label="val acc phase2")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(OUTPUT_DIR / "phase2_val_acc.png", dpi=120)
+    plt.close(fig)
 
 
 if __name__ == "__main__":
