@@ -7,7 +7,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import seaborn as sns
 import tensorflow as tf
+from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.utils.class_weight import compute_class_weight
 from tensorflow import keras
 from tensorflow.keras import layers
@@ -87,7 +89,7 @@ def get_inner_backbone(model: Model) -> keras.Model:
 
 def build_model(num_classes: int, augment: keras.Sequential) -> Model:
     inputs = Input(shape=(IMG_SIZE, IMG_SIZE, 3))
-    x = augment(inputs, training=True)
+    x = augment(inputs)
     x = EfficientNetPreprocess()(x)
     base = EfficientNetB0(include_top=False, weights="imagenet", name="efficientnetb0")
     base.trainable = False
@@ -110,7 +112,6 @@ def main() -> None:
     train_ds, val_ds, test_ds, class_names = load_ds(train_dir, test_dir)
     num_classes = len(class_names)
     cw = class_weights_for_dataset(train_ds, num_classes)
-    print("Class weights:", cw)
 
     aug = make_augmentation()
     model = build_model(num_classes, aug)
@@ -129,12 +130,11 @@ def main() -> None:
     )
     es = keras.callbacks.EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True)
 
-    e1, e2 = 8, 5
     print("--- Phase 1 ---")
     model.fit(
         train_ds,
         validation_data=val_ds,
-        epochs=e1,
+        epochs=8,
         class_weight=cw,
         callbacks=[ckpt, es],
         verbose=1,
@@ -152,10 +152,10 @@ def main() -> None:
         metrics=["accuracy"],
     )
     print("--- Phase 2 ---")
-    hist2 = model.fit(
+    model.fit(
         train_ds,
         validation_data=val_ds,
-        epochs=e2,
+        epochs=5,
         class_weight=cw,
         callbacks=[ckpt, es],
         verbose=1,
@@ -168,11 +168,14 @@ def main() -> None:
         )
 
     model.evaluate(test_ds, verbose=1)
-    fig, ax = plt.subplots(figsize=(5, 4))
-    ax.plot(hist2.history["val_accuracy"], label="val acc phase2")
-    ax.legend()
+    y_true = np.concatenate([y.numpy() for _, y in test_ds], axis=0)
+    y_pred = np.argmax(model.predict(test_ds, verbose=0), axis=1)
+    print(classification_report(y_true, y_pred, target_names=class_names, digits=4, zero_division=0))
+    cm = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=class_names, yticklabels=class_names, ax=ax)
     fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "phase2_val_acc.png", dpi=120)
+    fig.savefig(OUTPUT_DIR / "confusion_matrix_test.png", dpi=150)
     plt.close(fig)
 
 
