@@ -145,7 +145,7 @@ def build_model(img_size: int, num_classes: int, augment: keras.Sequential) -> M
     # augmentation only runs during training not validation or test
     x = augment(inputs)
     x = EfficientNetPreprocess(name="efficientnet_preprocess")(x)
-    # backbone as a layer so it stays as a nested model
+    # backbone as a layer so it stays as a nested model for fine tuning and grad cam
     base = EfficientNetB0(include_top=False, weights="imagenet")
     base.trainable = False
     x = base(x)
@@ -174,6 +174,59 @@ def get_last_conv_layer_name(backbone: keras.Model) -> str:
     raise RuntimeError("Could not find a convolutional layer in the backbone.")
 
 
+def _head_layers_after_backbone(model: Model) -> list:
+    idx = next(
+        i
+        for i, layer in enumerate(model.layers)
+        if isinstance(layer, keras.Model) and "efficientnet" in layer.name.lower()
+    )
+    return model.layers[idx + 1 :]
+
+
+def _gradcam_inner_and_tail(backbone: keras.Model, last_conv_layer_name: str) -> tuple[Model, Model]:
+    top_conv = backbone.get_layer(last_conv_layer_name)
+    inner = Model(backbone.input, top_conv.output, name="gradcam_to_top_conv")
+    tail = Model(top_conv.output, backbone.output, name="gradcam_after_top_conv")
+    return inner, tail
+
+
+def make_gradcam_heatmap(
+    img_array: np.ndarray | tf.Tensor,
+    model: Model,
+    inner: Model,
+    bb_tail: Model,
+    pred_index: int | None = None,
+) -> np.ndarray:
+    img_array = tf.cast(img_array, tf.float32)
+    aug = model.get_layer("data_augmentation")
+    prep = model.get_layer("efficientnet_preprocess")
+    head = _head_layers_after_backbone(model)
+
+    with tf.GradientTape() as tape:
+        x = aug(img_array, training=False)
+        x = prep(x)
+        conv_outputs = inner(x, training=False)
+        x = bb_tail(conv_outputs, training=False)
+        for layer in head:
+            if isinstance(layer, (layers.BatchNormalization, layers.Dropout)):
+                x = layer(x, training=False)
+            else:
+                x = layer(x)
+        predictions = x
+        if pred_index is None:
+            pred_index = int(tf.argmax(predictions[0]))
+        class_channel = predictions[:, pred_index]
+
+    grads = tape.gradient(class_channel, conv_outputs)
+    if grads is None:
+        raise RuntimeError("Grad-CAM gradient is None (graph not differentiable on conv features).")
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    conv_outputs = conv_outputs[0]
+    heatmap = tf.reduce_sum(tf.multiply(pooled_grads, conv_outputs), axis=-1)
+    heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + tf.keras.backend.epsilon())
+    return heatmap.numpy()
+
+
 def save_gradcam_examples(
     model: Model,
     test_ds: tf.data.Dataset,
@@ -182,30 +235,37 @@ def save_gradcam_examples(
     img_size: int,
     n: int = 3,
 ) -> None:
-    gdir = out_dir / "gradcam"
-    gdir.mkdir(parents=True, exist_ok=True)
     backbone = get_inner_backbone(model)
     last_conv = get_last_conv_layer_name(backbone)
-    conv_layer = backbone.get_layer(last_conv)
-    try:
-        keras.Model(
-            inputs=model.input,
-            outputs=[conv_layer.output, model.output],
-            name="gradcam_broken",
-        )
-    except Exception as e:
-        (gdir / "gradcam_build_failed.txt").write_text(
-            "Grad-CAM submodel could not be built (typical with nested EfficientNet in Keras 3):\n"
-            f"{type(e).__name__}: {e}\n",
-            encoding="utf-8",
-        )
-        print("Grad-CAM skipped (nested graph):", e)
-        return
-    (gdir / "gradcam_not_implemented.txt").write_text(
-        "Submodel built but heatmap path not wired in this snapshot (see next commit).\n",
-        encoding="utf-8",
-    )
-    return
+    inner, bb_tail = _gradcam_inner_and_tail(backbone, last_conv)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    taken = 0
+    for images, labels in test_ds:
+        for i in range(images.shape[0]):
+            if taken >= n:
+                return
+            img = images[i : i + 1]
+            label = int(labels[i].numpy())
+            heatmap = make_gradcam_heatmap(img, model, inner, bb_tail)
+            heatmap = np.uint8(255 * heatmap)
+            heatmap = np.expand_dims(heatmap, axis=-1)
+            heatmap = tf.image.resize(heatmap, (img_size, img_size)).numpy().squeeze()
+            heatmap_color = plt.cm.jet(heatmap / 255.0)[:, :, :3]
+            raw = img[0].numpy()
+            raw = np.clip(raw, 0, 255).astype(np.float32)
+            superimposed = 0.55 * (raw / 255.0) + 0.45 * heatmap_color
+            superimposed = np.clip(superimposed, 0, 1)
+            fig, ax = plt.subplots(1, 2, figsize=(8, 4))
+            ax[0].imshow(raw.astype(np.uint8))
+            ax[0].set_title(f"True: {class_names[label]}")
+            ax[0].axis("off")
+            ax[1].imshow(superimposed)
+            ax[1].set_title("Grad-CAM overlay")
+            ax[1].axis("off")
+            fig.tight_layout()
+            fig.savefig(out_dir / f"gradcam_sample_{taken}.png", dpi=150)
+            plt.close(fig)
+            taken += 1
 
 
 def collect_predictions(model: Model, ds: tf.data.Dataset) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
