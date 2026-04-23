@@ -1,0 +1,32 @@
+{
+  "model": "baseline_scratch_cnn",
+  "test_loss": 0.6006430387496948,
+  "test_accuracy": 0.7734553813934326,
+  "macro_f1": 0.7752388056510409,
+  "weighted_f1": 0.7724335065011354,
+  "per_class": {
+    "BACTERIAL": {
+      "precision": 0.7759562841530054,
+      "recall": 0.7717391304347826,
+      "f1-score": 0.773841961852861,
+      "support": 184
+    },
+    "NORMAL": {
+      "precision": 0.8888888888888888,
+      "recall": 0.9180327868852459,
+      "f1-score": 0.9032258064516129,
+      "support": 122
+    },
+    "VIRAL": {
+      "precision": 0.65625,
+      "recall": 0.6412213740458015,
+      "f1-score": 0.6486486486486487,
+      "support": 131
+    }
+  },
+  "binary_sick_at_0.5": {
+    "precision_sick": 0.9649681528355105,
+    "recall_sick": 0.9619047618742252,
+    "f1_sick": 0.9634340172269305
+  }
+}

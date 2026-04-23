@@ -1,0 +1,9 @@
+{
+  "search_type": "RandomSearch_quick_epochs_4",
+  "best_val_accuracy": 0.7506925463676453,
+  "best_hyperparameters": {
+    "units": 128,
+    "dropout": 0.5,
+    "learning_rate": 0.0021043482724264983
+  }
+}

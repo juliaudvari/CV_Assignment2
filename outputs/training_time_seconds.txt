@@ -1,3 +1,3 @@
-phase1_seconds: 319.60
-phase2_seconds: 428.01
-total_fit_seconds: 747.62
+phase1_seconds: 1212.81
+phase2_seconds: 1952.41
+total_fit_seconds: 3165.22
