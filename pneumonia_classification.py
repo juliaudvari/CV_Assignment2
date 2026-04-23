@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import seaborn as sns
 import tensorflow as tf
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.utils.class_weight import compute_class_weight
@@ -27,6 +29,12 @@ DEFAULT_TEST = _ROOT / "chest_xray" / "test"
 OUTPUT_DIR = SCRIPT_DIR / "outputs"
 MODEL_PATH = OUTPUT_DIR / "best_chest_xray.keras"
 
+
+def keras_tuner_work_dir() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or str(Path.home())
+    p = Path(base) / "cv_ca2_keras_tuner"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 @keras.utils.register_keras_serializable(package="cv_ca2")
@@ -46,6 +54,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--quick", action="store_true", help="Fewer epochs for a fast sanity check.")
     p.add_argument("--no-train", action="store_true", help="Load saved model and only evaluate / visualize.")
     p.add_argument("--weights", type=Path, default=None, help="Optional .keras path (default: outputs/best_chest_xray.keras).")
+    p.add_argument("--tune", action="store_true", help="Run Keras Tuner Hyperband search (slow); writes outputs/tuner_results.json.")
+    p.add_argument(
+        "--tune-quick",
+        action="store_true",
+        help="Run a short RandomSearch (few trials/epochs) for reportable tuner results; writes outputs/tuner_results.json.",
+    )
+    p.add_argument(
+        "--baseline",
+        action="store_true",
+        help="Train/evaluate a small from-scratch CNN (Moodle-style) on the same split; writes baseline_report_metrics.json and exits.",
+    )
+    p.add_argument(
+        "--tune-only",
+        action="store_true",
+        help="With --tune-quick or --tune: run Keras Tuner only, then exit (writes outputs/tuner_results.json; no main model train).",
+    )
     p.add_argument("--no-gradcam", action="store_true")
     return p.parse_args()
 
@@ -284,6 +308,151 @@ def write_report_metrics(
     print(f"Wrote metrics snapshot for report generator: {path}")
 
 
+def build_baseline_scratch_cnn(img_size: int, num_classes: int) -> Model:
+    inputs = Input(shape=(img_size, img_size, 3), name="image")
+    x = layers.Rescaling(1.0 / 255.0)(inputs)
+    x = layers.Conv2D(32, 3, padding="same", activation="relu")(x)
+    x = layers.MaxPooling2D(2)(x)
+    x = layers.Conv2D(64, 3, padding="same", activation="relu")(x)
+    x = layers.MaxPooling2D(2)(x)
+    x = layers.Flatten()(x)
+    x = layers.Dense(128, activation="relu")(x)
+    x = layers.Dropout(0.5)(x)
+    outputs = layers.Dense(num_classes, activation="softmax")(x)
+    return Model(inputs, outputs, name="baseline_scratch_cnn")
+
+
+def run_baseline_only(args: argparse.Namespace) -> None:
+    set_seed(args.seed)
+    out = args.output_dir
+    out.mkdir(parents=True, exist_ok=True)
+    train_dir, test_dir = args.train_dir, args.test_dir
+    if not train_dir.is_dir() or not test_dir.is_dir():
+        raise SystemExit(f"Train or test directory missing. Expected:\n  {train_dir}\n  {test_dir}")
+
+    train_ds, val_ds, test_ds, class_names = load_datasets(
+        train_dir, test_dir, args.img_size, args.batch_size, args.seed
+    )
+    num_classes = len(class_names)
+    class_weight = class_weights_for_dataset(train_ds, num_classes)
+    normal_index = class_names.index("NORMAL") if "NORMAL" in class_names else 0
+
+    model = build_baseline_scratch_cnn(args.img_size, num_classes)
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+    max_epochs = 12 if args.quick else 35
+    patience = 2 if args.quick else 5
+    ckpt = out / "baseline_best.keras"
+    cb = [
+        keras.callbacks.ModelCheckpoint(
+            filepath=str(ckpt),
+            monitor="val_accuracy",
+            mode="max",
+            save_best_only=True,
+            verbose=1,
+        ),
+        keras.callbacks.EarlyStopping(monitor="val_loss", patience=patience, restore_best_weights=True),
+        keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=max(1, patience // 2)),
+    ]
+    print("--- Baseline scratch CNN (same data split as improved model) ---")
+    t0 = time.perf_counter()
+    model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=max_epochs,
+        class_weight=class_weight,
+        callbacks=cb,
+        verbose=1,
+    )
+    t1 = time.perf_counter()
+    with open(out / "baseline_training_time_seconds.txt", "w", encoding="utf-8") as f:
+        f.write(f"total_fit_seconds: {t1 - t0:.2f}\n")
+    if ckpt.is_file():
+        model = keras.models.load_model(ckpt)
+
+    test_loss, test_acc = model.evaluate(test_ds, verbose=1)
+    y_true, y_pred, probs = collect_predictions(model, test_ds)
+    report_dict = classification_report(
+        y_true, y_pred, target_names=class_names, digits=4, zero_division=0, output_dict=True
+    )
+    macro_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    weighted_f1 = f1_score(y_true, y_pred, average="weighted", zero_division=0)
+    true_sick, _ = sick_binary_masks(y_true, normal_index)
+    p_sick = 1.0 - probs[:, normal_index]
+    bm = binary_metrics_from_scores(true_sick, p_sick, threshold=0.5)
+
+    base_path = out / "baseline_report_metrics.json"
+    per_class = {}
+    for name in class_names:
+        block = report_dict.get(name, {})
+        per_class[name] = {
+            "precision": float(block.get("precision", 0.0)),
+            "recall": float(block.get("recall", 0.0)),
+            "f1-score": float(block.get("f1-score", 0.0)),
+            "support": int(block.get("support", 0)),
+        }
+    base_path.write_text(
+        json.dumps(
+            {
+                "model": "baseline_scratch_cnn",
+                "test_loss": float(test_loss),
+                "test_accuracy": float(test_acc),
+                "macro_f1": float(macro_f1),
+                "weighted_f1": float(weighted_f1),
+                "per_class": per_class,
+                "binary_sick_at_0.5": {k: float(v) for k, v in bm.items()},
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    print(f"Wrote baseline metrics: {base_path}")
+    cm = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Oranges", xticklabels=class_names, yticklabels=class_names, ax=ax)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title("Baseline scratch CNN (test)")
+    fig.tight_layout()
+    fig.savefig(out / "confusion_matrix_baseline_test.png", dpi=150)
+    plt.close(fig)
+    print(f"\nBaseline done. Artifacts under: {out.resolve()}")
+
+
+def write_tuner_results(out_dir: Path, tuner, best_hp, search_type: str) -> None:
+    best_score = None
+    try:
+        trials = tuner.oracle.get_best_trials(num_trials=1)
+        if trials and trials[0].score is not None:
+            best_score = float(trials[0].score)
+    except Exception:
+        pass
+    raw_vals = dict(best_hp.values)
+    serializable = {}
+    for k, v in raw_vals.items():
+        if hasattr(v, "item"):
+            try:
+                serializable[k] = float(v.item())
+                continue
+            except (ValueError, TypeError):
+                pass
+        if isinstance(v, (float, int, str, bool)) or v is None:
+            serializable[k] = v
+        else:
+            serializable[k] = str(v)
+    payload = {
+        "search_type": search_type,
+        "best_val_accuracy": best_score,
+        "best_hyperparameters": serializable,
+    }
+    path = out_dir / "tuner_results.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"Wrote tuner summary: {path}")
+
+
 def sick_binary_masks(y: np.ndarray, normal_index: int) -> tuple[np.ndarray, np.ndarray]:
     true_sick = (y != normal_index).astype(int)
     return true_sick, np.array([normal_index])
@@ -302,6 +471,106 @@ def binary_metrics_from_scores(
     rec = tp / (tp + fn + 1e-8)
     f1 = 2 * prec * rec / (prec + rec + 1e-8)
     return {"precision_sick": prec, "recall_sick": rec, "f1_sick": f1}
+
+
+def _chest_tuner_hypermodel(num_classes: int, img_size: int, augment: keras.Sequential) -> type:
+    import keras_tuner as kt
+
+    class ChestHyperModel(kt.HyperModel):
+        def build(self, hp):
+            inputs = Input(shape=(img_size, img_size, 3))
+            x = augment(inputs)
+            x = EfficientNetPreprocess()(x)
+            base = EfficientNetB0(include_top=False, weights="imagenet")
+            base.trainable = False
+            x = base(x)
+            x = GlobalAveragePooling2D()(x)
+            x = BatchNormalization()(x)
+            u = hp.Int("units", min_value=128, max_value=512, step=128)
+            dr = hp.Float("dropout", 0.2, 0.6, step=0.1)
+            x = Dense(u, activation="relu")(x)
+            x = Dropout(dr)(x)
+            out = Dense(num_classes, activation="softmax")(x)
+            m = Model(inputs, out)
+            lr = hp.Float("learning_rate", 1e-4, 1e-2, sampling="log")
+            m.compile(
+                optimizer=keras.optimizers.Adam(learning_rate=lr),
+                loss="sparse_categorical_crossentropy",
+                metrics=["accuracy"],
+            )
+            return m
+
+    return ChestHyperModel
+
+
+def run_tuner_hyperband(
+    train_ds: tf.data.Dataset,
+    val_ds: tf.data.Dataset,
+    num_classes: int,
+    img_size: int,
+    class_weight: dict[int, float],
+    out_dir: Path,
+    augment: keras.Sequential,
+):
+    try:
+        import keras_tuner as kt
+    except ImportError as e:
+        raise SystemExit("keras-tuner is required for --tune / --tune-quick. Run: pip install keras-tuner") from e
+
+    ChestHyperModel = _chest_tuner_hypermodel(num_classes, img_size, augment)
+    twd = keras_tuner_work_dir()
+    print(f"Keras Tuner trial files (local): {twd}")
+    tuner = kt.Hyperband(
+        ChestHyperModel(),
+        objective="val_accuracy",
+        max_epochs=8,
+        factor=3,
+        directory=str(twd),
+        project_name="chest_xray_hyperband",
+        overwrite=True,
+    )
+    tuner.search(train_ds, validation_data=val_ds, class_weight=class_weight, verbose=1)
+    best_hp = tuner.get_best_hyperparameters(1)[0]
+    write_tuner_results(out_dir, tuner, best_hp, "Hyperband")
+    return best_hp
+
+
+def run_tuner_quick_random(
+    train_ds: tf.data.Dataset,
+    val_ds: tf.data.Dataset,
+    num_classes: int,
+    img_size: int,
+    class_weight: dict[int, float],
+    out_dir: Path,
+    augment: keras.Sequential,
+):
+    try:
+        import keras_tuner as kt
+    except ImportError as e:
+        raise SystemExit("keras-tuner is required for --tune / --tune-quick. Run: pip install keras-tuner") from e
+
+    ChestHyperModel = _chest_tuner_hypermodel(num_classes, img_size, augment)
+    twd = keras_tuner_work_dir()
+    print(f"Keras Tuner trial files (local): {twd}")
+    tuner = kt.RandomSearch(
+        ChestHyperModel(),
+        objective=kt.Objective("val_accuracy", direction="max"),
+        max_trials=3,
+        directory=str(twd),
+        project_name="chest_xray_random_quick",
+        overwrite=True,
+    )
+    epochs = 4
+    tuner.search(
+        train_ds,
+        validation_data=val_ds,
+        class_weight=class_weight,
+        epochs=epochs,
+        verbose=1,
+    )
+    best_hp = tuner.get_best_hyperparameters(1)[0]
+    write_tuner_results(out_dir, tuner, best_hp, f"RandomSearch_quick_epochs_{epochs}")
+    return best_hp
 
 
 def run_pipeline(args: argparse.Namespace) -> None:
@@ -334,6 +603,36 @@ def run_pipeline(args: argparse.Namespace) -> None:
     print("Class weights (balanced):", class_weight)
 
     normal_index = class_names.index("NORMAL") if "NORMAL" in class_names else 0
+
+    if args.tune_only:
+        if not (args.tune_quick or args.tune):
+            raise SystemExit("--tune-only requires --tune-quick or --tune")
+        if args.tune_quick:
+            print("Running Keras Tuner (RandomSearch, quick)...")
+            best_hp = run_tuner_quick_random(
+                train_ds, val_ds, num_classes, args.img_size, class_weight, out, augment
+            )
+        else:
+            print("Running Keras Tuner (Hyperband)...")
+            best_hp = run_tuner_hyperband(
+                train_ds, val_ds, num_classes, args.img_size, class_weight, out, augment
+            )
+        print("Best hyperparameters:", best_hp.values)
+        print("Done (--tune-only: main EfficientNet training skipped).")
+        return
+
+    if args.tune_quick and not args.no_train:
+        print("Running Keras Tuner (RandomSearch, quick - for reportable best hparams / val accuracy)...")
+        best_hp = run_tuner_quick_random(
+            train_ds, val_ds, num_classes, args.img_size, class_weight, out, augment
+        )
+        print("Best hyperparameters:", best_hp.values)
+    elif args.tune and not args.no_train:
+        print("Running Keras Tuner (Hyperband)...")
+        best_hp = run_tuner_hyperband(
+            train_ds, val_ds, num_classes, args.img_size, class_weight, out, augment
+        )
+        print("Best hyperparameters:", best_hp.values)
 
     model = build_model(args.img_size, num_classes, augment)
     model.compile(
@@ -454,8 +753,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
     print(f"Macro F1: {macro_f1:.4f}  Weighted F1: {weighted_f1:.4f}")
 
     cm = confusion_matrix(y_true, y_pred)
-    import seaborn as sns
-
     fig, ax = plt.subplots(figsize=(6, 5))
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=class_names, yticklabels=class_names, ax=ax)
     ax.set_xlabel("Predicted")
@@ -489,7 +786,12 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
-    run_pipeline(args)
+    if args.baseline and args.tune_only:
+        raise SystemExit("Use either --baseline or --tune-only, not both.")
+    if args.baseline:
+        run_baseline_only(args)
+    else:
+        run_pipeline(args)
 
 
 if __name__ == "__main__":
