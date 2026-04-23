@@ -31,7 +31,7 @@ MODEL_PATH = OUTPUT_DIR / "best_chest_xray.keras"
 
 
 def keras_tuner_work_dir() -> Path:
-    base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or str(Path.home())
+base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or str(Path.home())
     p = Path(base) / "cv_ca2_keras_tuner"
     p.mkdir(parents=True, exist_ok=True)
     return p
@@ -39,7 +39,7 @@ def keras_tuner_work_dir() -> Path:
 
 @keras.utils.register_keras_serializable(package="cv_ca2")
 class EfficientNetPreprocess(layers.Layer):
-    def call(self, x):
+def call(self, x):
         return preprocess_input(x)
 
 
@@ -175,7 +175,7 @@ def get_last_conv_layer_name(backbone: keras.Model) -> str:
 
 
 def _head_layers_after_backbone(model: Model) -> list:
-    idx = next(
+idx = next(
         i
         for i, layer in enumerate(model.layers)
         if isinstance(layer, keras.Model) and "efficientnet" in layer.name.lower()
@@ -184,7 +184,7 @@ def _head_layers_after_backbone(model: Model) -> list:
 
 
 def _gradcam_inner_and_tail(backbone: keras.Model, last_conv_layer_name: str) -> tuple[Model, Model]:
-    top_conv = backbone.get_layer(last_conv_layer_name)
+top_conv = backbone.get_layer(last_conv_layer_name)
     inner = Model(backbone.input, top_conv.output, name="gradcam_to_top_conv")
     tail = Model(top_conv.output, backbone.output, name="gradcam_after_top_conv")
     return inner, tail
@@ -269,7 +269,7 @@ def save_gradcam_examples(
 
 
 def collect_predictions(model: Model, ds: tf.data.Dataset) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    y_true = np.concatenate([y.numpy() for _, y in ds], axis=0)
+y_true = np.concatenate([y.numpy() for _, y in ds], axis=0)
     probs = np.asarray(model.predict(ds, verbose=0))
     y_pred = np.argmax(probs, axis=1)
     return y_true, y_pred, probs
@@ -309,7 +309,7 @@ def write_report_metrics(
 
 
 def build_baseline_scratch_cnn(img_size: int, num_classes: int) -> Model:
-    inputs = Input(shape=(img_size, img_size, 3), name="image")
+inputs = Input(shape=(img_size, img_size, 3), name="image")
     x = layers.Rescaling(1.0 / 255.0)(inputs)
     x = layers.Conv2D(32, 3, padding="same", activation="relu")(x)
     x = layers.MaxPooling2D(2)(x)
@@ -323,7 +323,7 @@ def build_baseline_scratch_cnn(img_size: int, num_classes: int) -> Model:
 
 
 def run_baseline_only(args: argparse.Namespace) -> None:
-    set_seed(args.seed)
+set_seed(args.seed)
     out = args.output_dir
     out.mkdir(parents=True, exist_ok=True)
     train_dir, test_dir = args.train_dir, args.test_dir
@@ -454,7 +454,7 @@ def write_tuner_results(out_dir: Path, tuner, best_hp, search_type: str) -> None
 
 
 def sick_binary_masks(y: np.ndarray, normal_index: int) -> tuple[np.ndarray, np.ndarray]:
-    true_sick = (y != normal_index).astype(int)
+true_sick = (y != normal_index).astype(int)
     return true_sick, np.array([normal_index])
 
 
