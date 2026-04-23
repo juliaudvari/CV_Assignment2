@@ -1,3 +1,14 @@
+"""
+Chest X-ray 3-class classification (BACTERIAL / NORMAL / VIRAL).
+Transfer learning (EfficientNetB0), augmentation, class weights, GlobalAveragePooling2D,
+full test-set metrics, optional Grad-CAM. Writes outputs/report_metrics.json after evaluation for build_report_docx.py.
+
+Run: py -3.13 pneumonia_classification.py
+Quick test: py -3.13 pneumonia_classification.py --quick
+Baseline (starter-style CNN, same split): py -3.13 pneumonia_classification.py --baseline
+Quick tuner demo: py -3.13 pneumonia_classification.py --tune-quick
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -23,15 +34,15 @@ from tensorflow.keras.layers import BatchNormalization, Dense, Dropout, GlobalAv
 from tensorflow.keras.models import Model
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-_ROOT = SCRIPT_DIR if (SCRIPT_DIR / "chest_xray").is_dir() else SCRIPT_DIR.parent.parent
-DEFAULT_TRAIN = _ROOT / "chest_xray" / "train"
-DEFAULT_TEST = _ROOT / "chest_xray" / "test"
+DEFAULT_TRAIN = SCRIPT_DIR / "chest_xray" / "train"
+DEFAULT_TEST = SCRIPT_DIR / "chest_xray" / "test"
 OUTPUT_DIR = SCRIPT_DIR / "outputs"
 MODEL_PATH = OUTPUT_DIR / "best_chest_xray.keras"
 
 
 def keras_tuner_work_dir() -> Path:
-base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or str(Path.home())
+    """Put Keras Tuner state on local disk (not OneDrive). Tuner uses rmtree(overwrite); cloud folders often get I/O errors."""
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or str(Path.home())
     p = Path(base) / "cv_ca2_keras_tuner"
     p.mkdir(parents=True, exist_ok=True)
     return p
@@ -39,7 +50,9 @@ base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or str(Path.home
 
 @keras.utils.register_keras_serializable(package="cv_ca2")
 class EfficientNetPreprocess(layers.Layer):
-def call(self, x):
+    """Maps float RGB in ~[0,255] (Keras image_dataset_from_directory) to EfficientNet preprocessing."""
+
+    def call(self, x):
         return preprocess_input(x)
 
 
@@ -142,10 +155,10 @@ def class_weights_for_dataset(train_ds: tf.data.Dataset, num_classes: int) -> di
 
 def build_model(img_size: int, num_classes: int, augment: keras.Sequential) -> Model:
     inputs = Input(shape=(img_size, img_size, 3), name="image")
-    # augmentation only runs during training not validation or test
+    # Let Keras propagate training=False on val/test/evaluate so augmentation runs only during training.
     x = augment(inputs)
     x = EfficientNetPreprocess(name="efficientnet_preprocess")(x)
-    # use backbone as a layer so it stays as a nested model for fine tuning and grad cam
+    # Call the backbone as a layer so it stays a nested `Functional` model (fine-tune + Grad-CAM).
     base = EfficientNetB0(include_top=False, weights="imagenet")
     base.trainable = False
     x = base(x)
@@ -175,7 +188,11 @@ def get_last_conv_layer_name(backbone: keras.Model) -> str:
 
 
 def _head_layers_after_backbone(model: Model) -> list:
-idx = next(
+    """Layers after the nested EfficientNet backbone (GAP → … → logits).
+
+    Do not match `efficientnet_preprocess` — only the `Functional` backbone (e.g. efficientnetb0).
+    """
+    idx = next(
         i
         for i, layer in enumerate(model.layers)
         if isinstance(layer, keras.Model) and "efficientnet" in layer.name.lower()
@@ -184,7 +201,8 @@ idx = next(
 
 
 def _gradcam_inner_and_tail(backbone: keras.Model, last_conv_layer_name: str) -> tuple[Model, Model]:
-top_conv = backbone.get_layer(last_conv_layer_name)
+    """Keras 3 cannot build Model(full_input, nested_intermediate); split the backbone."""
+    top_conv = backbone.get_layer(last_conv_layer_name)
     inner = Model(backbone.input, top_conv.output, name="gradcam_to_top_conv")
     tail = Model(top_conv.output, backbone.output, name="gradcam_after_top_conv")
     return inner, tail
@@ -269,7 +287,8 @@ def save_gradcam_examples(
 
 
 def collect_predictions(model: Model, ds: tf.data.Dataset) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-y_true = np.concatenate([y.numpy() for _, y in ds], axis=0)
+    """One full pass for labels, then `model.predict` on the cached dataset (faster than per-batch predict)."""
+    y_true = np.concatenate([y.numpy() for _, y in ds], axis=0)
     probs = np.asarray(model.predict(ds, verbose=0))
     y_pred = np.argmax(probs, axis=1)
     return y_true, y_pred, probs
@@ -286,6 +305,7 @@ def write_report_metrics(
     weighted_f1: float,
     binary_metrics: dict[str, float],
 ) -> None:
+    """Snapshot test metrics for build_report_docx.py (regenerate Word/PDF after training)."""
     per_class = {}
     for name in class_names:
         block = report_dict.get(name, {})
@@ -309,7 +329,8 @@ def write_report_metrics(
 
 
 def build_baseline_scratch_cnn(img_size: int, num_classes: int) -> Model:
-inputs = Input(shape=(img_size, img_size, 3), name="image")
+    """Shallow CNN + Flatten (Moodle-style starter: few conv blocks, no pre-training, no augmentation)."""
+    inputs = Input(shape=(img_size, img_size, 3), name="image")
     x = layers.Rescaling(1.0 / 255.0)(inputs)
     x = layers.Conv2D(32, 3, padding="same", activation="relu")(x)
     x = layers.MaxPooling2D(2)(x)
@@ -323,7 +344,8 @@ inputs = Input(shape=(img_size, img_size, 3), name="image")
 
 
 def run_baseline_only(args: argparse.Namespace) -> None:
-set_seed(args.seed)
+    """Train/evaluate baseline on the same train/val/test layout as the improved model."""
+    set_seed(args.seed)
     out = args.output_dir
     out.mkdir(parents=True, exist_ok=True)
     train_dir, test_dir = args.train_dir, args.test_dir
@@ -454,7 +476,8 @@ def write_tuner_results(out_dir: Path, tuner, best_hp, search_type: str) -> None
 
 
 def sick_binary_masks(y: np.ndarray, normal_index: int) -> tuple[np.ndarray, np.ndarray]:
-true_sick = (y != normal_index).astype(int)
+    """BACTERIAL + VIRAL treated as 'sick' vs NORMAL."""
+    true_sick = (y != normal_index).astype(int)
     return true_sick, np.array([normal_index])
 
 

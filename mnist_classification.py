@@ -1,3 +1,8 @@
+"""Trains a simple deep NN on MNIST (TensorFlow 2.x / Keras 3 compatible).
+
+Original Keras example: ~98% test accuracy after a few epochs on CPU/GPU.
+"""
+
 from __future__ import annotations
 
 import tensorflow as tf
